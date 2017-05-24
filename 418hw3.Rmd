@@ -1,0 +1,662 @@
+---
+title: "Stats 418 Homework 3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+**Lucy Baden**
+
+## Introduction
+
+For this homework, we selected the Adult Data Set from the UCI Machine Learning Repository. The dataset consists of income data from the 1994 US census, with 48,842 cases and fifteen features. We will use binary classification on this data to determine whether a person makes over 50k a year.
+
+```{r, echo=FALSE, include=FALSE}
+library(ROCR)
+library(h2o)
+library(glmnet)
+library(xgboost)
+library(readr)
+```
+First, we'll get the data from the UCI archive and do some quick cleaning.
+```{r, cache=TRUE}
+adult.test = read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test", header=F, skip=1, sep=",")
+adult.data = read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data", header=F, sep=",")
+dat <- rbind(adult.test, adult.data)
+
+dat$y <- NA
+dat[which(dat[,15] == " >50K"),'y'] <- 1
+dat[which(dat[,15] == " >50K."),'y'] <- 1
+dat[which(dat[,15] == " <=50K."),'y'] <- 0
+dat[which(dat[,15] == " <=50K"),'y'] <- 0
+
+dat$y <- as.factor(dat$y)
+
+dat$V15 <- NULL
+
+length(which(dat$y == "1"))
+length(which(dat$y == 0))
+
+dim(dat)
+```
+We can see that there are over 10,000 positive and 10,000 negative examples, and 14 predictor variables.
+
+We'll try several different binary classification algorithms, including logistic regression (LR), random forests (RF), and gradient-boosted machines (GBM). For each algorithm, we'll try two different implementations in R, perform parameter tuning in each case, and examine the model's AUC for comparison.
+
+To prepare the data, we can first split it into training, test, and validation sets (70-15-15), first in base R and then using h2o, one of the implementations we'll use throughout. Training sets will be used to train the model, and then we'll calculate the model AUC using the validation set to prevent overfitting. This will allow us to identify the best models, which we can then use to predict the test set to get a general AUC score.
+```{r, include=FALSE}
+set.seed(1)
+N <- nrow(dat)
+id_train <- sample(1:N, 0.7*N)
+train <- dat[id_train,]
+
+temp <- dat[-id_train,]
+id_test <- sample(1:nrow(temp), 0.5*nrow(temp))
+test <- temp[id_test,]
+validation <- temp[-id_test,]
+
+X <- Matrix::sparse.model.matrix(y ~ . - 1, data = dat)
+X_train <- X[id_train,]
+X_temp <- X[-id_train,]
+X_test <- X_temp[id_test,]
+X_val <- X_temp[-id_test,]
+
+# setting up for xgboost
+xgb_train <- xgb.DMatrix(data = X_train, label = ifelse(train$y=='1',1,0))
+n_proc <- parallel::detectCores()
+
+# setting up for h2o
+h2o.init(nthreads=-1)
+
+hdat <- as.h2o(dat)
+hdat_split <- h2o.splitFrame(hdat, ratios = c(0.7, 0.15), seed = 1)
+htrain <- hdat_split[[1]]
+htest <- hdat_split[[2]]
+hvalidation <- hdat_split[[3]]
+
+Xnames <- names(htrain)[which(names(htrain)!="y")]
+```
+
+## Logistic Regression
+**glmnet**  
+We start by using glmnet, first without regularization, meaning there is no penalty on the complexity of the model.
+
+```{r, cache=TRUE}
+LR_1 <- glmnet( X_train, train$y, family = "binomial", lambda = 0)
+phat <- predict(LR_1, newx = X_val, type = "response")
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+```{r, echo=FALSE, cache=TRUE}
+perf <- performance(rocr_pred, "tpr", "fpr")
+plot(perf, avg= "threshold", colorize=T, lwd= 3,
+     main= "Logistic Regression Without Regularization ROC Curve On Validation Set")
+plot(perf, lty=3, col="grey78", add=T)
+```
+  
+The ROC curve plots the true positive rate vs the false positive rate. The curve is fairly large and close to the top left of the plot. We can see that the AUC is already very good (a 100% score would mean perfect predictions on the validation set), which is expected since it measures the area beneath the ROC curve. 
+
+Next, we'll try a logistic regression model with glmnet using regularization. We'll also use cross-validation to determine the best value of lambda, the penalty for model complexity.
+
+```{r, cache=TRUE}
+LR_2 <- cv.glmnet( X_train, train$y, family = "binomial", type.measure="auc")
+lambda <- LR_2$lambda.min
+lambda
+
+phat <- predict(LR_2, newx = X_val, type = "response")
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+Finally, we'll do logistic regression in glmnet with the value of lambda selected previously.
+```{r, cache=TRUE}
+LR_3 <- glmnet(X_train, train$y, family = "binomial", lambda=lambda)
+phat <- predict(LR_3, newx = X_val, type = "response")
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+
+We can see that all of the glmnet LR models have similar AUC, although we get our best results with some tuning of lambda.  
+
+  
+**h2o**  
+Next, we will do logistic regression in h2o, and get the AUC first without regularization:
+```{r, include=FALSE, cache=TRUE}
+LR_4 <- h2o.glm(x = Xnames, y = "y", training_frame = htrain, 
+                family = "binomial", alpha = 1, lambda = 0)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(LR_4, hvalidation))
+
+```
+
+And then with regularization:
+```{r, include=FALSE, cache=TRUE}
+LR_5 <- h2o.glm(x = Xnames, y = "y", training_frame = htrain, 
+                family = "binomial", alpha = 1, lambda_search=T)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(LR_5, hvalidation))
+```
+
+We can even try regularization using the best lambda found using glmnet, although there's no guarantee it'd be any better in this implementation:
+```{r, include=FALSE, cache=TRUE}
+LR_6 <- h2o.glm(x = Xnames, y = "y", training_frame = htrain, 
+                family = "binomial", alpha = 1, lambda=lambda)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(LR_6, hvalidation))
+```
+  
+We can see that the best logistic regression model was LR_3, in glmnet with the value of lambda selected as having the best AUC with cross-validation. We can now see how well this model performs on the test set:
+```{r, cache=TRUE}
+phat <- predict(LR_3, newx = X_test, type = "response")
+
+rocr_pred <- prediction(phat, test$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+```{r, echo=FALSE, cache=TRUE}
+perf <- performance(rocr_pred, "tpr", "fpr")
+plot(perf, avg= "threshold", colorize=T, lwd= 3,
+     main= "Best Logistic Regression Model ROC Curve On Test Set")
+plot(perf, lty=3, col="grey78", add=T)
+
+```
+  
+We can see that looks very similar to the first model we tried, since they both used glmnet to do logistic regression, and this model only has slightly improved results.
+
+## Random Forest
+**h20**  
+We will first implement random forests using h2o. We can tune many different parameters when implementing random forest, including the number of trees, the maximum tree depth, and the number of features used in each split.
+
+We can start with 50 trees and a maximum depth of 20:
+```{r, include=FALSE, cache=TRUE}
+RF_1 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 50, max_depth = 20)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_1, hvalidation))
+
+```
+The AUC is already better than the best logistic regression model, even without any tuning of the parameters.  
+
+We can increase this to a 100 trees and see a corresponding increase in AUC:
+```{r, include=FALSE, cache=TRUE}
+RF_2 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 100, max_depth = 20)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_2, hvalidation))
+```
+
+Now we can try tuning the maximum tree depth from 20 to 30, although this actually decreases the AUC:
+```{r, include=FALSE, cache=TRUE}
+RF_3 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 100, max_depth = 30)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_3, hvalidation))
+```
+Whereas decreasing the max tree depth to 10 gets a better result than 30, but not as good as 20:
+```{r, include=FALSE, cache=TRUE}
+RF_4 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 100, max_depth = 10)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_4, hvalidation))
+
+```
+A compromise on the depth and number of trees gives the best AUC results so far, with 120 trees and a maximum depth of 12.
+```{r, include=FALSE, cache=TRUE}
+RF_5 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 120, max_depth = 12)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_5, hvalidation)) 
+```
+We can also tune the number of features used in each split to get better AUC results. First, we can try 2 features:
+```{r, include=FALSE, cache=TRUE}
+RF_6 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 120, 
+                        max_depth = 12, mtries=2)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_6, hvalidation))
+
+```
+Next, we can try 5 features:
+```{r, include=FALSE, cache=TRUE}
+RF_7 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 120, 
+                         max_depth = 12, mtries=5)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_7, hvalidation))
+
+```
+
+We can also investigate the effects of overtraining by using too many trees or a high maximum depth. At first, the AUC may increase with the number of trees; for example with 200 trees, we get:
+```{r, include=FALSE, cache=TRUE}
+RF_8 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 200, 
+                         max_depth = 12, mtries=6)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_8, hvalidation))
+
+```
+
+But with too many trees, the model will overtrain on the training set and start to give poor results on the validation set, like when we have 300 trees:
+```{r, include=FALSE, cache=TRUE}
+RF_9 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 300, 
+                         max_depth = 12, mtries=6)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(RF_9, hvalidation))
+```
+  
+**xgboost**  
+Next, we can implement random forests using the xgboost package. We can start with 50 trees and a depth of 20:
+
+```{r, cache=TRUE}
+RF_10 <- xgboost(data = X_train, label = ifelse(train$y=='1',1,0),
+                nthread = n_proc, nround = 1, max_depth = 20,
+                num_parallel_tree = 50, subsample = 0.632,
+                colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                save_period = NULL)
+
+phat <- predict(RF_10, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+```
+The AUC is the lowest yet, although we can improve it slightly be increasing the number of trees to 200:
+
+```{r, cache=TRUE}
+RF_11 <- xgboost(data = X_train, label = ifelse(train$y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 20,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+
+phat <- predict(RF_11, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+And also by decreasing the maximum tree depth to 10:
+```{r, cache=TRUE}
+RF_12 <- xgboost(data = X_train, label = ifelse(train$y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 10,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+
+phat <- predict(RF_12, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+By contrast, increasing the maximum tree depth to 30 only decreases the AUC.
+```{r, cache=TRUE}
+RF_13 <- xgboost(data = X_train, label = ifelse(train$y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 30,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = 1/sqrt(length(X_train@x)/nrow(X_train)),
+                 save_period = NULL)
+
+phat <- predict(RF_13, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+We can also tune the number of columns used in each split:
+```{r, cache=TRUE}
+RF_14 <- xgboost(data = X_train, label = ifelse(train$y=='1',1,0),
+                 nthread = n_proc, nround = 1, max_depth = 10,
+                 num_parallel_tree = 200, subsample = 0.632,
+                 colsample_bytree = .5,
+                 save_period = NULL)
+
+phat <- predict(RF_14, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+This gives the best AUC result for xgboost random forests so far, but it's not close to the best h2o random forest model.
+
+Overall, the best random forest model is RF_8, done using h2o with 200 trees, a maximum tree depth of 12, and 6 features used in each split.
+We can look at this model's performance on the test set, as well as its ROC curve.
+```{r, cache=TRUE}
+RF_8 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 200, 
+                         max_depth = 12, mtries=6)
+h2o.auc(h2o.performance(RF_8, htest))
+
+plot(h2o.performance(RF_8, htest), type="roc", main = "Best Random Forest Model ROC Curve")
+```
+
+## Gradient-Boosted Machines
+**h20**  
+We will first implement GBMs using h2o. We can tune many different parameters when implementing GBMs, including the number of trees, the maximum tree depth, and the learning rate.
+
+We can start with 300 trees, a maximum depth of 20, a learning rate of 0.1, and nbins, the number of bins used when dividing the data to split, of 20.
+```{r, include=FALSE, cache=TRUE}
+GBM_1 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+              ntrees = 300, max_depth = 20, learn_rate = 0.1, 
+              nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_1, hvalidation))
+```
+Although not as good as the best RF models, the initial AUC for GBMs is within reach. We can improve it by first tuning the number of trees. We can see that a decrease from 300 to 200 trees doesn't impact the AUC:
+```{r, include=FALSE, cache=TRUE}
+GBM_2 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+              ntrees = 200, max_depth = 20, learn_rate = 0.1, 
+              nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_2, hvalidation))
+```
+We can also increase and decrease the tree depth until we find an ideal value. Trying to lower the maximum tree depth to 10, we see that the AUC increases:
+```{r, include=FALSE, cache=TRUE}
+GBM_4 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                 ntrees = 200, max_depth = 10, learn_rate = 0.1, 
+                 nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_4, hvalidation))
+```
+And it continues to increase with a max depth of 7:
+```{r, include=FALSE, cache=TRUE}
+GBM_5 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                 ntrees = 200, max_depth = 7, learn_rate = 0.1, 
+                 nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_5, hvalidation))
+```
+The AUC peaks at a max depth of 6:
+```{r, include=FALSE, cache=TRUE}
+GBM_6 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                 ntrees = 200, max_depth = 6, learn_rate = 0.1, 
+                 nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_6, hvalidation))
+```
+And begins to decrease again once the maximum depth is lowered to 5:
+```{r, include=FALSE, cache=TRUE}
+GBM_7 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                 ntrees = 200, max_depth = 5, learn_rate = 0.1, 
+                 nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_7, hvalidation))
+```
+
+With the maximum depth giving best results at 6, we can now move on to tuning the learning rate. First, we can try a slight increase of the learning rate from 0.1 to 0.12 to see if it improves the AUC:
+```{r, include=FALSE, cache=TRUE}
+GBM_11 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                  ntrees = 200, max_depth = 6, learn_rate = 0.12, 
+                  nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_11, hvalidation))
+```
+The AUC has slightly decreased from the previous best when the learning rate was 0.1 in the GBM_6 model. We can try a slight decrease of the learning rate instead, from 0.1 to 0.08:
+```{r, include=FALSE, cache=TRUE}
+GBM_12 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                  ntrees = 200, max_depth = 6, learn_rate = 0.08, 
+                  nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_12, hvalidation)) 
+```
+This AUC is better than the previous best score. We can also try a learning rate of 0.09:
+```{r, include=FALSE, cache=TRUE}
+GBM_13 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                  ntrees = 200, max_depth = 6, learn_rate = 0.09, 
+                  nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_13, hvalidation))
+```
+Or of 0.07:
+```{r, include=FALSE, cache=TRUE}
+GBM_14 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                  ntrees = 200, max_depth = 6, learn_rate = 0.07, 
+                  nbins = 20, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_14, hvalidation))
+```
+
+But both of these have lower AUC scores than when the learning rate is 0.08.
+
+With the learning rate set, we can also tune nbins. 
+First, we can decrease nbins to 10 and see the AUC improve even further:
+```{r, include=FALSE, cache=TRUE}
+GBM_16 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", ntrees = 200, max_depth = 6, 
+                  learn_rate = 0.08, nbins = 10, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_16, hvalidation))
+```
+The AUC improves further with an nbins of 5.
+```{r, include=FALSE, cache=TRUE}
+GBM_17 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", ntrees = 200, max_depth = 6, learn_rate = 0.08, nbins = 5, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_17, hvalidation))
+```
+Decreasing nbins to 4, however, decreases the AUC:
+```{r, include=FALSE, cache=TRUE}
+GBM_18 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", ntrees = 200, max_depth = 6, learn_rate = 0.08, 
+                  nbins = 4, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_18, hvalidation))
+```
+As does increasing nbins to 6:
+```{r, include=FALSE, cache=TRUE}
+GBM_19 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                ntrees = 200, max_depth = 6, learn_rate = 0.08, 
+                  nbins = 6, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_19, hvalidation))
+```
+
+Therefore, we will settle on nbins = 5.
+
+We can also use early stopping to determine the number of trees used. For example, we can try stopping the GBM early if the performance metric doesn't improve for a certain number of rounds. First, we can try just 1 round:
+```{r, include=FALSE, cache=TRUE}
+GBM_20 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+              ntrees = 200, max_depth = 6, learn_rate = 0.08, stopping_rounds=1,
+                  nbins = 5, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_20, hvalidation))
+```
+However, this gives us no change in AUC. Increasing the number of rounds gives the same result:
+```{r, include=FALSE, cache=TRUE}
+GBM_21 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+              ntrees = 200, max_depth = 6, learn_rate = 0.08, stopping_rounds=10,
+                  nbins = 5, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_21, hvalidation))
+```
+
+We can also try decreasing the stopping tolerance, meaning that the performance metric has to improve by an even smaller number in a certain number of rounds or the GBM will be stopped early.
+
+```{r, include=FALSE, cache=TRUE}
+GBM_22 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+              ntrees = 200, max_depth = 6, learn_rate = 0.08, stopping_rounds=10,
+                  stopping_tolerance = 0.0001, stopping_metric="AUC", nbins = 5, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_22, hvalidation))
+```
+However, this again yields no change. We can also see what happens if we don't use early stopping and overfit the model by increasing the number of trees and iterations, with a tree number of 700 and max depth of 20:
+```{r, include=FALSE, cache=TRUE}
+GBM_24 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", 
+                ntrees = 700, max_depth = 20, learn_rate = 0.08, nbins = 5, seed = 123)
+```
+```{r, cache=TRUE}
+h2o.auc(h2o.performance(GBM_24, hvalidation))
+```
+As we'd expect, the model overfits on the training set and its AUC on the validation set decreases.
+
+**xgboost**  
+Finally, we can implement GBMs in xgboost. In xgboost, we can tune the max number of iterations, the maximum tree depth, and the learning rate, as well as experiment with early stopping.
+
+We can start with 300 max iterations, a max depth of 20, and a learning rate of 0.1:
+```{r, cache=TRUE}
+GBM_25 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                  nround = 300, max_depth = 20, eta = 0.1)
+
+phat <- predict(GBM_25, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+The AUC is very good, although not better than the best scores from h2o.
+
+We can now tune the max tree depth, starting by decreasing it to 10:
+```{r, cache=TRUE}
+GBM_27 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 10, eta = 0.1)
+
+phat <- predict(GBM_27, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]] 
+```
+
+Since the AUC has improved, we can keep decreasing the max depth, first to 5:
+```{r, cache=TRUE}
+GBM_28 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 5, eta = 0.1)
+
+phat <- predict(GBM_28, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+Next, we can try a max depth of 4:
+```{r, cache=TRUE}
+GBM_29 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 4, eta = 0.1)
+
+phat <- predict(GBM_29, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+Since the AUC continues to improve, we can try a max depth of 3:
+
+```{r, cache=TRUE}
+GBM_30 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 3, eta = 0.1)
+
+phat <- predict(GBM_30, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+However, now the AUC has begun to decrease, suggesting that we should stay with a max tree depth of 4.  
+
+Next, we can tune the learning rate, first changing it from 0.1 to 0.11:
+```{r, cache=TRUE}
+GBM_33 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 4, eta = 0.11)
+
+phat <- predict(GBM_33, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+The resulting AUC is the best so far. We can increase it to see if that would be better, but the resulting AUC is somewhat lower.
+```{r, cache=TRUE}
+GBM_36 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 4, eta = 0.12)
+
+phat <- predict(GBM_36, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+Therefore, we will keep the learning rate at 0.11.
+
+Next, we can try early stopping with 2 rounds:
+```{r, cache=TRUE}
+GBM_37 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 4, eta = 0.11, early_stopping_rounds = 2,
+                    watchlist=list(validation1=xgb_train))
+
+phat <- predict(GBM_37, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+The AUC decreases significantly. We can also try 20 rounds instead:
+```{r, cache=TRUE}
+GBM_38 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 300, max_depth = 4, eta = 0.11, early_stopping_rounds = 20,
+                    watchlist=list(validation1=xgb_train))
+
+phat <- predict(GBM_38, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]] 
+```
+The resulting AUC is the same as without any early stopping at all.
+
+Finally, we can try more iterations to see when the model will stop improving and start overfitting. First, we can try 500 iterations:
+```{r, cache=TRUE}
+GBM_39 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 500, max_depth = 4, eta = 0.11)
+
+phat <- predict(GBM_39, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+The resulting AUC is the best yet. However, with even more iterations added in, the model begins to overfit, resulting in a decreased AUC:
+
+```{r, cache=TRUE}
+GBM_40 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 1000, max_depth = 4, eta = 0.11)
+
+phat <- predict(GBM_40, newdata = X_val)
+
+rocr_pred <- prediction(phat, validation$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+```
+
+The best GBM model is GBM_39, with 500 iterations, a max depth of 4, and a learning rate of 0.11. We can now see how this model performs on the test dataset:
+```{r, cache=TRUE}
+GBM_39 <- xgb.train(data = xgb_train, nthread = n_proc, objective = "binary:logistic", 
+                    nround = 500, max_depth = 4, eta = 0.11)
+
+phat <- predict(GBM_39, newdata = X_test)
+
+rocr_pred <- prediction(phat, test$y)
+performance(rocr_pred, "auc")@y.values[[1]]
+
+perf <- performance(rocr_pred, "tpr", "fpr")
+plot(perf, avg= "threshold", colorize=T, lwd= 3,
+     main= "Best GBM Model ROC Curve On Test Set")
+plot(perf, lty=3, col="grey78", add=T)
+```
+  
+We can see that this GBM has the highest AUC on the test set by a significant amount among the GBM, RF, and LR algorithms. Each of these algorithms produced fairly good initial results across multiple implementations, although some implementations were clearly superior in certain cases, like h2o over xgboost for random forests. The tuning of various parameters in the models ended up being the difference between which algorithm produced the best model, judging by AUC. It's possible that with even more tuning and experimentation, we could produce even higher AUC scores with either GBMs or random forests. However, based on these analyses, a gradient-boosted machine would likely produce the best results.
+
+Although the algorithms gave different results across different algorithms, looking at the three ROC Curve plots for the best model from each of the three, we can see that they all have similar results. In each model, the true positive rate approaches 1 when the false positive rate is around 0.5, whereas the false positive rate approaches 0 when the true positive rate is around 0.4 or 0.3. For a problem like predicting income, the best tradeoff would likely be somewhere in between those two extremes; for example, an average false positive rate of 0.1 and an average true positive rate of about 0.8.
+
+
