@@ -1,0 +1,575 @@
+---
+title: "Stats 418 Homework 4"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+### Lucy Baden
+
+## Introduction and Overview
+
+In this homework, we continued investigating the Adult Data Set from the UCI Machine Learning Repository first examined in Homework 3. The Adult Data Set, obtained from the UCI Machine Learning Repository, consists of income data from the 1994 US census, with 48,842 cases and 15 features. In this analysis, we will use a number of different methods of binary classification to determine whether a person makes over $50,000 a year, and explore which algorithms and architectures achieved the best results.
+
+In the previous homework, Logistic Regression, Random Forests, and Gradient Boosted Machines (GBMs) were performed, and a GBM with the $\texttt{xgboost}$ package in $\texttt{R}$ produced the best results according to AUC criterion. In this document, Neural Networks, a GBM model with hyperparameter optimization, and ensembles of various models were all attempted. All of these methods showed good results on the dataset, with AUCs ranging from approximately .903 to .921, demonstrating high predictive power. Overall, the best models came from GBMs or other complex models in which the parameters were carefully tuned, either using a random grid search for parameter optimization or manually from training many different models with the same algorithm and only small differences in parameters.
+
+```{r, echo=FALSE, include=FALSE}
+library(ROCR)
+library(h2o)
+library(glmnet)
+library(xgboost)
+library(readr)
+library(knitr)
+library(ggplot2)
+```
+
+
+## Data Cleaning and Exploratory Analysis
+
+```{r, cache=TRUE, include=FALSE}
+adult.test = read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.test", header=F, skip=1, sep=",")
+adult.data = read.table("https://archive.ics.uci.edu/ml/machine-learning-databases/adult/adult.data", header=F, sep=",")
+dat <- rbind(adult.test, adult.data)
+
+dat$y <- NA
+dat[which(dat[,15] == " >50K"),'y'] <- 1
+dat[which(dat[,15] == " >50K."),'y'] <- 1
+dat[which(dat[,15] == " <=50K."),'y'] <- 0
+dat[which(dat[,15] == " <=50K"),'y'] <- 0
+
+dat$y <- as.factor(dat$y)
+
+dat$V15 <- NULL
+
+colnames(dat) <- c("age", 'workclass', 'fnlwgt', 'education', 'educationnum', 'maritalstatus', 'occupation', 'relationship', 'race', 'sex', 'capitalgain', 'capitalloss', 'hoursperweek', 'country', 'y')
+```
+The adult data set was downloaded from https://archive.ics.uci.edu/ml/machine-learning-databases/adult/. The dataset was split into two .txt files, a test data set with one third of the data, and a training data set with two thirds of the data. These two data sets were merged together into one, and necessary cleaning operations were performed.  
+
+The variable of interest for classification is whether a person made over 50K a year. However, in the merged dataset this variable had four possible responses: " >50K", " >50K.", " <=50K." and " <=50K". This occurred because data was encoded with slight differences in the original training vs test text files. To simplify this variable, those with over 50K were encoded as 1 and those with less than or equal to 50K were encoded as 0. In total, the data included `r length(which(dat$y == "1"))` positive cases and `r length(which(dat$y == 0))` negative cases. Other variables also were properly renamed.  
+
+The cleaned dataset contains 6 continuous and 8 categorical variables, as well as the $\texttt{y}$ variable indicating whether the person made over \$50,000 per year. The variables are demographic information such as employment status, age, race, native country, education, and hours worked per week. A summary of the variables is given in the table below. `r kable(summary(dat[,1:15]))`  
+
+The fnlwgt variable contains the final weights that were used to control the data to independent estimates of the civilian noninstitutional population of the US, generating by the US Census Bureau. People with similar demographic characteristics generally have similar final weights. Also of note, the occupation variable has only 14 classes. Additional details on occupation would most likely be very useful to include as well.  
+
+Now we can examine some of the features in more details.  
+
+### Age
+```{r age, cache=TRUE, echo=FALSE}
+ggplot(dat, aes(age, length(age), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Age Category", y="Number", fill=">50K")+ ggtitle('Plot 1: Age') + 
+      theme(plot.title=element_text(hjust=.5))
+
+```
+  
+There is a clear difference between the shape of the age distribution for people who earn over 50K and those who earn less, suggesting that age may be helpful in predicting our variable of interest. It seems like younger people are more likely to be earning less than 50K, which is what you would reasonably expect.
+
+### Workclass
+Next, we can take a look at workclass. 
+```{r workclass, cache=TRUE, echo=FALSE}
+ggplot(dat, aes(workclass, length(workclass), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Workclass Category", y="Number", fill=">50K") + ggtitle('Plot 2: Workclass') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+```
+  
+Although it's difficult to compare between some of the smaller categories, it does appear that there are some categories in which the percentage of people >50K is significantly different from that in other categories, suggesting that this variable may be useful in the analyses as well.
+
+### Education
+Next, we can take a look at education. We have both the education variable, which contains different education classes (such as high school or bachelor's degree), and the education num variable, which contains the total number of years of education. 
+```{r Education, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(education, length(education), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Education Category", y="Number", fill=">50K") + ggtitle('Plot 3a: Education') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+ggplot(dat, aes(educationnum, length(educationnum), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Number of Years of Education", y="Number", fill=">50K") + ggtitle('Plot 3b: Education') + 
+      theme(plot.title=element_text(hjust=.5))
+
+```
+  
+It is easy to see that people with more years of education are also more likely to make over 50K.
+
+### Marital Status
+Next, we can examine the relationship between making >50K and marital status. 
+```{r Marital, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(maritalstatus, length(maritalstatus), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Marital Status Category", y="Number", fill=">50K") + ggtitle('Plot 4: Marital Status') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+Marital status also seems to have an effect on whether a person makes over 50K. In particular a higher number of people who are married to a civilian spouse do so.
+
+### Occupation
+Next, we can take a look at occupation.
+```{r Occupation, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(occupation, length(occupation), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Occupation Category", y="Number", fill=">50K") + ggtitle('Plot 5: Occupation') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+Just briefly looking at this plot is enough to surmise that some occupations pay more than others. This matches expectations, since it seems that occupation would be one of the most important determining factors for salary.
+
+### Relationship
+We can now examine relationships.  
+```{r relation, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(relationship, length(relationship), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Relationship Category", y="Number", fill=">50K") + ggtitle('Plot 6: Relationship') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+From this plot, it appears that husbands are most likely to make >50K out of the different categories, suggesting that this variable could be useful in future classification models.
+
+### Race
+We now examine the relationship between race and making >50K.
+```{r race, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(race, length(race), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Race Category", y="Number", fill=">50K") + ggtitle('Plot 7: Race') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+Clearly, white people are most likely to make >50K. The differences between categories suggest that this variable may be helpful for the analyses as well.
+
+### Sex
+We now examine gender and how it effects salary.  
+```{r sex, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(sex, length(sex), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Sex Category", y="Number", fill=">50K") + ggtitle('Plot 8: Sex') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+Here, men are more likely to make >50K. Again, this variable may be useful for analysis.
+
+### Capital Gains and Losses
+From our summary table, we know that capital gains have a median of 0 and a max of 100,000, meaning that the majority of people have none. Similarly, capital losses have a median of 0 and a max of 4356. This makes capital gains and losses difficult to plot, since only a small number of values are above 0. In fact, only `r 100*length(which(dat$capitalgain > 0))/nrow(dat)`% of the capital gain values are over 0, and only `r 100*length(which(dat$capitalloss > 0))/nrow(dat)`% of the capital loss values are over 0.
+
+### Hours Per Week
+We can now look at the number of hours worked per week.
+```{r hpw, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(hoursperweek, length(hoursperweek), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Hours Worked Per Week Category", y="Number", fill=">50K") + ggtitle('Plot 9: Hours Worked Per Week') + 
+      theme(plot.title=element_text(hjust=.5))
+
+
+```
+  
+This variable also appears to be of interest for predicting who makes >50K per year.
+
+### Country
+Finally, we can examine the relationship between a person's native country and whether they make >50K per year.
+```{r country, cache=TRUE, echo=FALSE}
+par(mfrow=c(1,2))
+ggplot(dat, aes(country, length(country), fill=y))+geom_bar(stat="identity",position="stack")+labs(x="Native Country Category", y="Number", fill=">50K") + ggtitle('Plot 10: Native Country') + 
+      theme(plot.title=element_text(hjust=.5), axis.text.x=element_text(angle=60,hjust=1))
+
+
+```
+  
+Since the native country of recipients is overwhelmingly the United States, this variable may not be particularly useful. However, it still could be instructive, particularly for people who have a different native country.
+
+Overall, this exploratory analysis suggests that most of the variables are valuable in predicting whether a person makes >50K. Some of them are likely to be highly related, such as education and educationnum, or maritalstatus and relationship. However, we will include all of them in our analyses and investigate the accuracy of the results.
+
+# Analysis
+```{r, include=FALSE}
+
+# setting up for h2o
+h2o.init(nthreads=-1)
+
+hdat <- as.h2o(dat)
+hdat_split <- h2o.splitFrame(hdat, ratios = c(0.7, 0.15), seed = 1)
+htrain <- hdat_split[[1]]
+htest <- hdat_split[[2]]
+hvalidation <- hdat_split[[3]]
+
+Xnames <- names(htrain)[which(names(htrain)!="y")]
+
+h2o.no_progress()
+```
+Before beginning analysis, data was randomly split into training, test, and validation sets, with 70% of the data going to training and the remaining 30% split equally between test and validation sets. Overall, the training data set contained `r nrow(htrain)` observations, the test data set contained `r nrow(htest)` observations, and the validation data set contained `r nrow(hvalidation)` observations.
+
+For each binary classification method, models were trained using the training set, with the validation set used for cross-validation. Model performance and accuracy was then tested by finding the model's AUC on the test set.
+
+## Neural Networks
+Neural networks were training using $\texttt{h2o}$. Parameters were tuned between models in order to increase predictive accuracy.  
+
+### Model 1
+The first neural network model was trained using defaults for the majority of parameters. However, early stopping was used based on AUC criterion, meaning that if continued iterations stopped improving the model's AUC, the iterations would stop and return the resulting model. The model used 100 metrics and 2 stopping rounds.
+The model's AUC on the test set was:
+
+```{r NN1, cache = TRUE, echo=FALSE}
+NN_1 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_1, htest)@metrics$AUC
+
+```
+```{r NN1b, cache=TRUE}
+NN_1
+```
+The metrics shown above were calculated on the training set. The confusion matrix below shows in more details the accuracy of the model on the test set.
+```{r NN1c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_1, htest))
+```
+Below, the ROC curve for the model is shown. This demonstrates the tradeoffs between the true positive and false positive rates. 
+
+```{r NN1d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_1, htest), type="roc", main = "Neural Net Model 1 ROC Curve")
+```
+  
+We can see that the curve follows the left-hand side of the graph up until a true positive rate of approximately 0.4, and it follows the top of the graph until a false positive rate of 0.4 as well. This suggests that the model is neither better at predicting true positives or false positives. However, the curve is reasonably large, suggesting that it has good predictive power; this is confirmed by the AUC value. That said, previous models discussed in Homework 3 were better on both counts.
+
+### Model 2
+In this neural network, we tuned the parameters dealing with hidden layers. The second model has hidden layers of size (50,50,50,50), and an input dropout ratio of 0.2 to attempt to improve generalization. The model's AUC on the test set was:
+```{r NN2, cache=TRUE, echo=FALSE}
+NN_2 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation,
+            hidden = c(50,50,50,50), input_dropout_ratio = 0.2, epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_2, htest)@metrics$AUC
+
+```
+```{r NN2b, cache=TRUE}
+NN_2
+```
+The confusion matrix below shows in more detail the accuracy of the model on the test set.
+```{r NN2c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_2, htest))
+```
+Below, the ROC curve for the second model is shown to demonstrate the tradeoffs between the true positive and false positive rates. 
+
+```{r NN2d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_2, htest), type="roc", main = "Neural Net Model 2 ROC Curve")
+```
+  
+We can see that the curve is very similar to the previous curve. Since the AUC has not increased significantly, only from approximately .907 to .908, and only small changes have been made to the neural network model, this is not surprising. However, the AUC does show improvement from the first neural network model, so we will continue to use this parameter tuning for future models. To tune the parameter further, models were also tried in which the only changes were increasing (200,200,200,200) and then decreasing (5) the size of the hidden layers. However, the above model provided the best results in terms of AUC.
+
+```{r NN3, cache=TRUE, echo=FALSE, include=FALSE}
+# hidden layer tuning
+NN_3 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation,
+            hidden = c(5), input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0)
+h2o.performance(NN_3, htest)@metrics$AUC
+
+```
+
+```{r NN4, cache=TRUE, echo=FALSE, include=FALSE}
+# hidden layer tuning
+NN_4 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation,
+            hidden = c(200,200,200,200), input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0)
+h2o.performance(NN_4, htest)@metrics$AUC
+
+```
+
+## Model 3 
+Next, a model was trained using regularization, which causes many weights to become zero and in some cases improves the stability of the model. We set the L1 and L2 regularization parameters to 1e-5. The model's AUC on the test set was:
+```{r NN5, cache=TRUE, echo=FALSE}
+NN_5 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation,
+            hidden = c(50,50,50,50), input_dropout_ratio = 0.2, l1 = 1e-5, l2 = 1e-5, 
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=12345)
+h2o.performance(NN_5, htest)@metrics$AUC
+
+```
+```{r NN5b, cache=TRUE, echo=FALSE}
+NN_5
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r NN5c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_5, htest))
+```
+Below, we can see the ROC curve for the third model. This plot shows the tradeoffs between the true positive rate and false positive rate for this model.
+
+```{r NN5d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_5, htest), type="roc", main = "Neural Net Model 3 ROC Curve")
+```
+  
+Once again, the ROC curve is similar to previous attempts. While changing the parameters of the neural network can produce enough fine tuning to improve its prediction accuracy, the changes are not so long that they can be spotted on the plot. However, we can tell that the AUC has increased from .9081 for Model 2 to .9091 for Model 3, so we will choose to continue to use these regularization parameters in future models.
+
+
+## Model 4
+In the fourth neural network model, the hidden dropout ratios parameter was tuned. This parameter specifies the ratio to be removed from the model per each hidden layer. The default is 0.5 per layer. For initial tuning, the ratios were set to (0.2, 0.1, 0.1, 0). The AUC on the test set was:
+```{r NN6, echo=FALSE, cache=TRUE}
+NN_6 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "RectifierWithDropout", hidden = c(50,50,50,50), hidden_dropout_ratios=c(0.2,0.1,0.1,0), l1 = 1e-5, l2 = 1e-5, 
+            input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_6, htest)@metrics$AUC
+
+```
+```{r NN6b, cache=TRUE, echo=FALSE}
+NN_6
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r NN6c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_6, htest))
+```
+Below, we can see the ROC curve for the fourth model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r NN6d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_6, htest), type="roc", main = "Neural Net Model 4 ROC Curve")
+```
+  
+The tradeoffs between the true positive and false positive rate again look very similar. The true positive rate nears 1 at a false positive rate of about 0.4, and the false positive rate nears 0 at a true positive rate of about 0.4. Although the AUC has increased a small amount from 0.9091 to 0.9095, the change is not visible on the plot. Still, the increase in AUC is worth including these new hidden dropout ratios in future models. For additional tuning, another neural network model was attempted with hidden dropout ratios (0.6,0.5,0.4,0.1), but produced a lower AUC.
+
+```{r NN7, cache=TRUE, echo=FALSE, include=FALSE}
+NN_7 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "RectifierWithDropout", hidden = c(50,50,50,50), l1 = 1e-5, l2 = 1e-5, hidden_dropout_ratios=c(0.6,0.5,0.4,0.1),
+            input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_7, htest)@metrics$AUC
+
+```
+
+## Model 5
+In the fifth neural network model, the adaptive learning rate parameters rho and epsilon were tuned. The default parameters are 0.99 and 1e-08. Here, the rho and epsilon parameters were first set to 0.95 and 1e-06 respectively. The model's AUC on the test set was:
+```{r NN8, echo=FALSE, cache=TRUE}
+NN_8 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "RectifierWithDropout", hidden = c(50,50,50,50), rho = 0.95, epsilon = 1e-06, hidden_dropout_ratios=c(0.2,0.1,0.1,0), l1 = 1e-5, l2 = 1e-5,
+            input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0)
+h2o.performance(NN_8, htest)@metrics$AUC
+
+```
+```{r NN8b, cache=TRUE, echo=FALSE}
+NN_8
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r NN8c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_8, htest))
+```
+Below, we can see the ROC curve for the fifth model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r NN8d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_8, htest), type="roc", main = "Neural Net Model 5 ROC Curve")
+```
+  
+This ROC curve shows some clear changes from the previous plots. First, we can see small gaps in the curve in the middle where it is most dense. In general, the points of the curve are much more compacted towards the center of the curve. There are no real tradeoffs available for a false positive rate between 0.6 and 1, for example, meaning that this model has a lessened ability to produce a true positive rate close to 1. However, this curve is similar to the others in that the false positive rate approaches 0 at a true positive rate of about 0.4, and the true positive rate approaches 1 at a false positive rate of about 0.4.  
+
+This lessened sensitivity is not a big issue, since the true positive rate is not as essential to the problem of determining whether someone's income is over 50K as it might be to a medical test, for example. Since the AUC did decrease slightly, though, from 0.9095 to 0.9074, these adaptive learning parameters will not be used in the future.  
+
+In another tuning attempt, a neural network was also trained with rho = 0.9999 and epsilon = 1e-09; however, the AUC was 0.9077, again lower than the previous models trained with default rho and epsilon values.
+
+```{r NN9, cache=TRUE, echo=FALSE, include=FALSE}
+# other attempt to tune adaptive learning rate parameters
+NN_9 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "RectifierWithDropout", hidden = c(50,50,50,50), rho = 0.9999, epsilon = 1e-09, hidden_dropout_ratios=c(0.2,0.1,0.1,0), l1 = 1e-5, l2 = 1e-5,
+            input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_9, htest)@metrics$AUC
+
+```
+
+## Model 6
+For the sixth model, the parameters dealing with momentum were tuned. The initial momentum was set to 0.5, up from the default 0. The momentum ramp parameter, which controlled the number of training samples for which momentum increased, was set to 1e5, and the final momentum was set to 0.99, again from a default of 0. 
+
+In order to allow for momentum tuning, the adaptive learning rate was set to false, and the learning rate was increased slightly to 0.01.  
+
+The AUC on the test set was:
+```{r NN10, echo=FALSE, cache=TRUE}
+NN_10 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "RectifierWithDropout", hidden = c(50,50,50,50),
+      hidden_dropout_ratios=c(0.2,0.1,0.1,0), l1 = 1e-5, l2 = 1e-5,
+            momentum_start = 0.5, momentum_ramp = 1e5, momentum_stable = 0.99, input_dropout_ratio = 0.2, adaptive_rate = FALSE, rate = 0.01,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_10, htest)@metrics$AUC
+
+```
+```{r NN10b, cache=TRUE, echo=FALSE}
+NN_10
+
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r NN10c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_10, htest))
+
+```
+Below, we can see the ROC curve for the sixth model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r NN10d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_10, htest), type="roc", main = "Neural Net Model 6 ROC Curve")
+
+```
+  
+This ROC curve looks very similar to the others for previous neural networks, with the exception of the ROC curve resulting from tuning adaptive learning parameters in Model 5. It shows the same tradeoffs. The AUC has decreased slightly from 0.9095 to 0.9093, so this particular momentum tuning offers no improvements.
+
+## Model 7
+For the seventh model, the rate annealing parameter was tuned to 1e-05. Additionally, we investigated removing the hidden dropout ratios tuning that we performed for previous models. Although it initially improved the AUC to include hidden dropout ratio tuning, several other parameters have been tuned since then; it may be beneficial at this point to remove the hidden dropout ratios tuning again. This also allows us to try the Rectifier activation function, instead of the RectifierWithDropout function used previously.  
+
+The AUC on the test set was:
+
+```{r NN11, echo=FALSE, cache=TRUE}
+NN_11 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "Rectifier", hidden = c(50,50,50,50), l1 = 1e-5, l2 = 1e-5, 
+            adaptive_rate = FALSE, rate = 0.01, rate_annealing = 1e-05,
+            momentum_start = 0.5, momentum_ramp = 1e5, momentum_stable = 0.99, input_dropout_ratio = 0.2,
+            epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1)
+h2o.performance(NN_11, htest)@metrics$AUC
+
+```
+```{r NN11b, cache=TRUE, echo=FALSE}
+NN_11
+
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r NN11c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(NN_11, htest))
+
+```
+Below, we can see the ROC curve for the seventh model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r NN11d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(NN_11, htest), type="roc", main = "Neural Net Model 7 ROC Curve")
+
+```
+  
+This ROC curve looks similar again to previous ROC curves, with similar tradeoffs. However, the AUC has increased to 0.9108 from 0.9095, making this the best neural network layer; in this case, removing the hidden layer dropout ratio tuning and using the Rectifier activation function did improve the model's prediction accuracy.
+
+## Hyperparameter Optimization with Random Search
+## Model 8
+Model 8 used Gradient Boosted Machines with hyperparameter optimization done by random grid search. Only 15 models were used for the search due to limited memory resources and processing power. The AUC for Model 8 on the test set was:
+
+
+```{r GBM17, cache=TRUE, echo=FALSE, include=FALSE}
+# best h2o GBM from previous homework
+GBM_17 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", ntrees = 200, max_depth = 6, learn_rate = 0.08, nbins = 5, seed = 1)
+
+h2o.auc(h2o.performance(GBM_17, htest))
+
+```
+
+```{r HOset, cache=TRUE, echo=FALSE}
+
+hyper_params <- list(ntrees = 200,  ## early stopping
+                     max_depth = 5:15, 
+                     min_rows = c(10,1,3,10,100),
+                     learn_rate = c(0.08,0.01,0.1),  
+                     learn_rate_annealing = c(0.99,0.995,1,1),
+                     sample_rate = c(0.4,0.7,1,1),
+                     col_sample_rate = c(0.7,1,1),
+                     nbins = c(5,30,100),
+                     nbins_cats = c(64,256,1024)
+)
+
+search_criteria <- list( strategy = "RandomDiscrete",
+                        max_runtime_secs = 600000,
+                        max_models = 15
+)
+```
+
+```{r H01, echo=FALSE, cache=TRUE}
+HO1 <- h2o.grid(algorithm = "gbm", grid_id = "grd",
+                  x = Xnames, y = "y", training_frame = htrain,
+                  validation_frame = hvalidation,
+                  hyper_params = hyper_params,
+                  search_criteria = search_criteria,
+                  stopping_metric = "AUC", stopping_tolerance = 1e-3, stopping_rounds = 2,
+                  seed = 1)
+
+mds_sort <- h2o.getGrid(grid_id = "grd", sort_by = "auc", decreasing = TRUE)
+
+md_best <- h2o.getModel(mds_sort@model_ids[[1]])
+
+h2o.auc(h2o.performance(md_best, htest))
+
+```
+```{r HO1b, cache=TRUE, echo=FALSE}
+md_best
+```
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r HO1c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(md_best, htest))
+
+```
+Below, we can see the ROC curve for the GBM model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r HO1d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(md_best, htest), type="roc", main = "Model 8: GBM With Hyperparameter Optimization ROC Curve")
+
+```
+
+The ROC curve's shape looks mostly similar to previous ROC curves; it seems to have similar tradeoffs between true positive and false positive rates. However, there is some difference, especially for true positive rates between 0 and 0.2. There are significantly fewer options available there where the false positive rate is close to zero. This may not be an issue, since having some small false positive rate greater than 0 would not be a huge problem when predicting whether someone has an income >50K.
+
+This model also has a higher AUC than the best neural network, having increased from 0.9108 to 0.9134. However, this is not the best result from a GBM, despite the hyperparameter optimization; the GBM made with $\texttt{xgboost}$ in Homework 3 gave a better AUC on the test set at .93038. It seems that even with parameter optimization using a random grid search, $\texttt{h2o}$ does not produce as good results as $\texttt{xgboost}$ for this particular dataset.  
+
+## Ensembles
+## Model 9
+The final model in this analysis is an ensemble model, combining various high performance models used throughout Homework 3 and this document. The ensemble consists of a neural network, logistic regression, random forest, and GBM; each included model performed the best of those using the same algorithm. Only $\texttt{h2o}$ models were used for ease of creating the ensemble. 5 fold cross validation was used for each model.
+
+The AUC on the test set was:  
+```{r E1, echo=FALSE, cache=TRUE}
+# Best neural network
+NN_10 <- h2o.deeplearning(x = Xnames, y = "y", training_frame = htrain, validation_frame = hvalidation, activation = "Rectifier", hidden = c(50,50,50,50), l1 = 1e-5, l2 = 1e-5, 
+            adaptive_rate = FALSE, rate = 0.01, rate_annealing = 1e-05,
+            momentum_start = 0.5, momentum_ramp = 1e5, momentum_stable = 0.99, input_dropout_ratio = 0.2, epochs = 100, stopping_rounds = 2, stopping_metric = "AUC", stopping_tolerance = 0, seed=1,
+            nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+
+```
+```{r E2, echo=FALSE, cache=TRUE}
+# Best logistic regression with h2o
+LR_4 <- h2o.glm(x = Xnames, y = "y", training_frame = htrain, 
+                family = "binomial", alpha = 1, lambda = 0, seed = 123,
+                nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+```
+```{r E3, echo=FALSE, cache=TRUE}
+# Best random forest
+RF_8 <- h2o.randomForest(x = Xnames, y = "y", training_frame = htrain, ntrees = 100, 
+                         max_depth = 12, mtries=6, seed = 123,
+                nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+```
+```{r E4, echo=FALSE, cache=TRUE}
+# Best GBM with h2o
+GBM_17 <- h2o.gbm(x = Xnames, y = "y", training_frame = htrain, distribution = "bernoulli", ntrees = 100, max_depth = 6, learn_rate = 0.08, nbins = 5, seed = 123, nfolds = 5, fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE)
+```
+```{r E5, cache=TRUE, echo=FALSE}
+# ensemble
+E_1 <- h2o.stackedEnsemble(x = Xnames, y = "y", training_frame = htrain, 
+                    base_models = list(NN_10@model_id, LR_4@model_id, RF_8@model_id, GBM_17@model_id))
+
+h2o.auc(h2o.performance(E_1, htest))
+
+h2o.getModel(E_1@model$metalearner$name)@model$coefficients_table
+
+```
+```{r E5b, cache=TRUE, echo=FALSE}
+E_1
+```
+We can see above that the logistic regression model was not used at all in the ensemble, and could be dropped with no consequence. The coefficients show that the GBM model was used most heavily by far, with a coefficient of 5.4, whereas the next most heavily used model was the neural network with a coefficient of 0.69.
+
+The confusion matrix below shows the accuracy of the model on the test set in more detail.
+```{r E5c, cache=TRUE, echo=FALSE}
+h2o.confusionMatrix(h2o.performance(E_1, htest))
+
+```
+Below, we can see the ROC curve for the ensemble model, demonstrating the tradeoffs between the true positive rate and false positive rate.
+
+```{r E5d, cache=TRUE, echo=FALSE}
+plot(h2o.performance(E_1, htest), type="roc", main = "Model 9: Ensemble ROC Curve")
+
+```
+  
+This ROC curve is very similar to that for the GBMs in Homework 3, or the neural networks used in this analysis. This is not surprising, considering that the ensemble model draws so heavily on the GBM included. We can see that it remains close to the left-hand side of the plot until a true positive rate of about 0.4, and close to the top of the plot until a false positive rate of about 0.4 as well, much like the other ROC curves discussed in this document. Unlike some other curves, there are no gaps in this plot; rather, the ROC curve becomes dense in the middle and less tradeoff options are available at close to a false positive rate of 0 or a true positive rate of 1. An option in the middle, such as a true positive rate of 0.8 and false positive rate of 0.2, is more likely to be helpful for a problem such as determining whether a person makes over 50K per year.
+
+## Discussion and Conclusion
+The table below shows the best models of the various algorithms attempted in Homeworks 3 and 4.
+
+```{r table, echo=FALSE}
+Models <- c("Best Logistic Regression (glmnet)", "Best Random Forest (h2o)", "Best Gradient Boosted Machine (xgboost)", "Best Neural Network (h2o)", "GBM with Hyperparameter Optimization (h2o)", "Ensemble (h2o)")
+
+AUCs <- c(0.9062075, 0.9125001, 0.9303814, 0.910881, 0.913453, 0.9215618)
+
+tab <- cbind(Models, AUCs)
+kable(tab)
+```
+
+
+The GBM produced by $\texttt{xgboost}$ performed best out of all the models on the test set. This may be a case of a certain architecture having an advantage for a particular data set, since the expectation may have been that a GBM made using a random grid search for hyperparameter optimization would perform even better. However, the GBM with random grid search did suffer from computational limitations, as all code was run on a single laptop with limited memory. Without more processing power, the random grid search was limited in how many models it could produce before crashing, and finished with only 15. Nearly as many models were created in order to manually tune the parameters for the $\texttt{xgboost}$ GBM. It is likely that a $\texttt{h2o}$ GBM with a random grid search could perform even better, if allowed to create 100+ models.
+
+The ensemble model also did not perform as well as may have been expected, though naturally it performed at least as well as each of its component models. However, since no easy solution currently exists for including an $\texttt{xgboost}$ model in an $\texttt{h2o}$ ensemble, this result is not a complete surprise.
+
+Although they did not have the best AUCs, the ensemble and the GBM with hyperparameter optimization took the most time to run. This is an expected result, since both algorithms include running several different models at a minimum. However, producing the GBM that gave the best result on the test set also took several hours of time, because other GBMs had to be produced along the way while manually tuning the parameters. It is likely that spending even more time tuning the parameters manually would give an even better GBM result, as would running a GBM with random search that produced more models or covered more parameter options. Similarly, an ensemble with more models, and more complex, well-performing models, would correspondingly perform better as well. Computational power and time are both limiting factors.
+
+Choice of architecture and algorithm generally had a higher impact than hyperparameter tuning. For example, logistic regression, a much simpler algorithm, did not approach the accuracy of more complex algorithms like GBMs, even with tuning. Also, significant hyperparameter optimization and tuning was done for $\texttt{h2o}$ GBMs. However, those models never produced results as accurate as those from the $\texttt{xgboost}$ GBM. That said, parameter tuning did provide real benefits to models' AUC. Looking at the initial AUC of the first neural network (.9075) as compared to the final tuned neural network (0.91088) shows some improvement, and the results are more drastic for GBMs with default parameters versus those that have their parameters finely tuned.
+
+That said, it is also worth noting that increases in AUC were generally marginal from model to model; looking over the ROC plots shows this as well, as many are indistinguishable. The difference between the AUC of the best model in the table above versus the worst is less than 0.025.
+
+Overall, if time and/or processing power are not an issue, the best model for predicting whether a person's income is greater than $50,000 per year would likely be an ensemble model that includes a GBM with hyperparameter optimization by random grid search. However, while such an ensemble would give the best result, it would also take a very long time to run. For this dataset, it may be optimal to run a GBM and briefly tune the parameters, thereby producing a model with only slightly lower AUC in significantly less time.
+
+
+
